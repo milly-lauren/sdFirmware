@@ -10,13 +10,18 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
+#include <math.h>
 
-#define FOSC    8388608
-#define BAUD    4800
-#define MYUBRR  FOSC/16/BAUD - 1
-#define LEDOFF  PORTB &= ~(1 << PORTB7)
-#define LEDON   PORTB |= (1 << PORTB7)
-#define FLAG   1
+#define FOSC        8388608
+#define BAUD        4800
+#define MYUBRR      FOSC/16/BAUD - 1
+#define LEDOFF      PORTB &= ~(1 << PORTB7)
+#define LEDON       PORTB |= (1 << PORTB7)
+#define FLAG        1
+#define WIND_PIN    DDE4
+
+volatile unsigned int TIMER1_COUNT;
+volatile unsigned int TIMER4_COUNT;
 
 
 /*********************************************
@@ -56,7 +61,7 @@
  {
     float temperature;
     float wind_mph;
-    float relative_humidty;
+    float relative_humidity;
     float heat_index;
     float barometric_prssr;
     float uv_index;
@@ -67,12 +72,25 @@
  {
     float temperature;
     float wind_mph;
-    float relative_humidty;
+    float relative_humidity;
     float heat_index;
     float barometric_prssr;
     float uv_index;
     int rain;       // How do we want to do avg for rain? Frequencies? 
  } avg_measures;
+
+/********************************
+ *          Wind Globals
+ ********************************/
+#define VaneOffset 0; // define the anemometer offset from magnetic north
+int VaneValue; // raw analog value from wind vane
+int Direction; // translated 0 - 360 direction
+int CalDirection; // converted value with offset applied
+int LastValue; // last direction value
+
+int SampleRequired; // this is set true every 3s. Get wind speed
+volatile unsigned long Rotations; // cup rotation counter used in interrupt routine
+volatile unsigned long ContactBounceTime; // Timer to avoid contact bounce in isr
 
 /*********************************************
  *              Hardware Functions
@@ -99,35 +117,39 @@ void init_t1()
    TCNT1  = 0;
    
    // Compare Match Register
-   // 10 second delay right now
+   // 5 second for regular sensors
    OCR1A = 40960;
+   // 15 second for light sensors
+   //OCR1B = 61439;
    // CTC mode
-   TCCR1B |= (1 << WGM12);
-   
+   //TCCR1B |= (1 << WGM12);
+   // Normal 
+   TCCR1B = 0;
    // Set CS12 and CS10 bits for 1024 prescaler
    TCCR1B |= (1 << CS12) | (1 << CS10);  
    
    // Enable timer compare interrupt
    TIMSK1 |= (1 << OCIE1A);
+   // TIMSK1 |= (1< << OCIE1B);
  
 }
 
-// Timer 3 for light sensors
+// Timer 3 for PWMs
 void init_t3()
 {
    // Initialize the timer
    TCCR3A = 0;
-   TCCR3B = 0
+   TCCR3B = 0;
    TCNT3  = 0;
    
    // Compare Match Register
    // 10 second delay right now
    OCR3A = 40960;
    // CTC mode
-   TCCR3B |= (1 << WGM12);
+   TCCR3B |= (1 << WGM32);
    
    // Set CS12 and CS10 bits for 1024 prescaler
-   TCCR3B |= (1 << CS12) | (1 << CS10);  
+   TCCR3B |= (1 << CS32) | (1 << CS30);  
    
    // Enable timer compare interrupt
    TIMSK3 |= (1 << OCIE3A);
@@ -146,82 +168,117 @@ void init_t4()
    // 10 second delay right now
    OCR4A = 40960;
    // CTC mode
-   TCCR4B |= (1 << WGM12);
+   TCCR4B |= (1 << WGM42);
    
    // Set CS12 and CS10 bits for 1024 prescaler
-   TCCR4B |= (1 << CS12) | (1 << CS10);  
+   TCCR4B |= (1 << CS42) | (1 << CS40);  
    
    // Enable timer compare interrupt
    TIMSK4 |= (1 << OCIE4A);
  
 }
 
-// Timer 1 Interrupt  ******************************* TIMER 1 **********************
-int i = 0;
-ISR(TIMER1_COMPA_vect)
-{  
-   // Toggle the LED    
-   PINB |= (1<<PINB7);
-//   uart_write_uint16(i);
-//   uart_putstring("\n");
-//   i++;
-//   if (i == 65535)
-//   {
-//     i = 0;
-//   }
-
-   // Poll I2C Sensors
-   current_measures.barometric_prssr = poll_pressure();
-   current_measures.relative_humidity = poll_humidity();
+// Timer 5 for wind sensor debouncing
+void init_t5()
+{
+   // Initialize the timer
+   TCCR5A = 0;
+   TCCR5B = 0;
+   TCNT5  = 0;
    
-   // ADC Sensors
-   // If this doesnt work, then individual functions that change MUX value in ADMUX
-   current_measures.temperature = adc_get_conversion(TEMP_CH);
-   current_measures.rain = adc_get_conversion(RAIN_CH);
-   current_measures.wind_mph = adc_get_conversion(WIND_CH);
-   //current_measures.uv_index = adc_get_conversion(UV_CH);
-
-   // Calculate Relative Humidity with measured humidity and temperature
-   current_measures.heat_index = calc_hi();
-
-   // Check the values against thresholds
-   check_thresholds();
+   // Compare Match Register
+   // 3 second delay
+   OCR5A = 12288;
+   // CTC mode
+   TCCR5B |= (1 << WGM52);
+   
+   // Set CS12 and CS10 bits for 1024 prescaler
+   TCCR5B |= (1 << CS52) | (1 << CS50);  
+   
+   // Enable timer compare interrupt
+   TIMSK5 |= (1 << OCIE5A);
+ 
 }
 
-// Timer 3 Interrupt      *************************** TIMER 3 *********************
-int TIMER3_COUNT = 0;
-ISR(TIMER3_COMPA_vect)
+// Timer 1 Interrupt  ******************************* TIMER 1A ISR **********************
+ISR(TIMER1_COMPA_vect)
+{  
+   
+   TIMER1_COUNT++;
+//   uart_putstring("timer 1 ISR ");
+   uart_write_uint16(TIMER1_COUNT);
+   uart_putstring("\n");
+   if (TIMER1_COUNT >= 4)
+   {
+     // Toggle the LED 
+     uart_putstring("toggle LED");   
+     PINB |= (1<<PINB7);
+     TIMER1_COUNT = 0;
+   }
+   
+//   // Poll I2C Sensors
+//   current_measures.barometric_prssr = poll_bp();
+//   current_measures.relative_humidity = poll_humidity();
+//   
+//   // ADC Sensors
+//   // If this doesnt work, then individual functions that change MUX value in ADMUX
+//   current_measures.temperature = adc_get_conversion(TEMP_CH);
+//   current_measures.rain = adc_get_conversion(RAIN_CH);
+//   //current_measures.uv_index = adc_get_conversion(UV_CH);
+//
+//   // Calculate Relative Humidity with measured humidity and temperature
+//   current_measures.heat_index = calc_hi();
+//
+//   // Check the values against thresholds
+//   check_thresholds();
+}
+
+// Timer 1B Interrupt      *************************** TIMER 1B ISR *********************
+int TIMER1B_COUNT = 0;
+ISR(TIMER1_COMPB_vect)
 {
   // Every 20 Minutes
-  if (TIMER3_COUNT == 120)
+  if (TIMER1B_COUNT == 120)
   {
-    current_measures.uv_index =  get_adc_conversion(UV_CH);
+    current_measures.uv_index =  adc_get_conversion(UV_CH);
     // Stretch Goals: Check Lux levels on other light diode 
+    TIMER1B_COUNT = 0;
   }
   else
   {
-    TIMER3_COUNT++;
+    TIMER1B_COUNT++;
   }
 }
 
-// Timer 4 Interrupt      *************************** TIMER 4 *********************
-int TIMER4_COUNT = 0;
-ISR(TIMER4_COMPA_vect)
+// Timer 3 Interrupt      *************************** TIMER 3 ISR *********************
+ISR(TIMER3_COMPA_vect)
 {
-  // Every 5 Minutes
-  if (TIMER4_COUNT == 30)
-  {
-    // Poll BP
-    current_measures.barometric_prssr = poll_bp();
-    TIMER4_COUNT = 0;
-  }
-  else if
-  {
-    TIMER4_COUNT++;
-  }
   
 }
 
+// Timer 4 Interrupt      *************************** TIMER 4 ISR *********************
+ISR(TIMER4_COMPA_vect)
+{
+   
+//  // Every 5 Minutes
+//  if (TIMER4_COUNT == 30)
+//  {
+//    // Poll BP
+//    current_measures.barometric_prssr = poll_bp();
+//    TIMER4_COUNT = 0;
+//  }
+//  else
+//  {
+//    TIMER4_COUNT++;
+//  }
+  
+}
+
+// Timer 5 Interrupt      *************************** TIMER 5 ISR *********************
+ISR(TIMER5_COMPA_vect)
+{
+  SampleRequired = 1;
+}
 /********************************
  *        UART Functions
  ********************************/
@@ -412,7 +469,7 @@ uint16_t adc_result()
 /*********************************************
  *                Sensor Functions
  *********************************************/
-void init_bp(int flag)
+void init_bp()
 {
     // Function used to initialize the pressure sensor
     // Set mode to forced, every time set to forced = measurement
@@ -495,59 +552,58 @@ float poll_humidity()
 /*********************************************
  *             Aditional Functions
  *********************************************/
-void check_tresholds()                  ****************** threshold checks ******************
+void check_thresholds()                 // ****************** threshold checks ******************
 {
   // 0 - Closed     1 - Open
   int roof_state = get_roof_state();
 
   if (current_measures.temperature > TEMP_MAX_THRESHOLD)
   {
-    uart_put_string("Temperature max triggered");
+    uart_putstring("Temperature max triggered");
     if (roof_state != TEMP_MAX)
-      change_roof_state(TEMP_MAX)
-
+      change_roof_state(TEMP_MAX);
   }
   else if (current_measures.temperature < TEMP_MIN_THRESHOLD)
   {
-    uart_put_string("Temperature min triggered");
+    uart_putstring("Temperature min triggered");
     if (roof_state != TEMP_MIN)
-      change_roof_state(TEMP_MIN)
+      change_roof_state(TEMP_MIN);
   }
   if (current_measures.wind_mph > WIND_THRESHOLD)
   {
-    uart_put_string("Wind triggered");
+    uart_putstring("Wind triggered");
     if (roof_state != WINDY)
-      change_roof_state(WINDY)
+      change_roof_state(WINDY);
   }
   if (current_measures.relative_humidity > RH_THRESHOLD)
   {
-    uart_put_string("Humidity triggered");
+    uart_putstring("Humidity triggered");
     if (roof_state != RH)
-      change_roof_state(RH)
+      change_roof_state(RH);
   }
   if (current_measures.heat_index > HI_THRESHOLD)
   {
-     uart_put_string("Heat index triggered");
+     uart_putstring("Heat index triggered");
      if (roof_state != HI)
-      change_roof_state(HI)
+      change_roof_state(HI);
   }
   if (current_measures.barometric_prssr > BP_THRESHOLD)
   {
-    uart_put_string("Barometric Pressure triggered");
+    uart_putstring("Barometric Pressure triggered");
     if (roof_state != BP)
-      change_roof_state(BP)
+      change_roof_state(BP);
   }
   if (current_measures.uv_index > UV_THRESHOLD)
   {
-    uart_put_string("UV Index triggered");
+    uart_putstring("UV Index triggered");
     if (roof_state != UV)
-      change_roof_state(UV)
+      change_roof_state(UV);
   }
   if (current_measures.rain)
   {
-    uart_put_string("Rain triggered");    
+    uart_putstring("Rain triggered");    
     if (roof_state != RAIN)
-      change_roof_state(RAIN)
+      change_roof_state(RAIN);
   }
 }
 
@@ -555,6 +611,11 @@ int get_roof_state()
 {
   // Now this is going to be either check proximity sensors or just check global? 
   return poll_proximity_sensors();
+}
+
+void change_roof_state(int new_setting)
+{
+  // Send PWM to actuators
 }
 
 int poll_proximity_sensors()
@@ -571,11 +632,40 @@ float calc_hi()
 
   float heat_index = (-42.379) + 2.04901523 * t_temp + 10.1433127 * t_rh -
                      (0.22475541 * t_temp * t_rh) - (0.00683783 * t_temp * t_temp) -
-                     (0.05481717 * t_rh * t_rh) + (0.0012287 t_temp * t_temp *t_rh) +
+                     (0.05481717 * t_rh * t_rh) + (0.0012287 * t_temp * t_temp * t_rh) +
                      ( 0.00085282 * t_temp * t_rh * t_rh ) - 
                      (0.00000199 * t_temp * t_temp * t_rh * t_rh);
 
    return heat_index;              
+}
+
+
+/*********************************************
+ *               Wind Functions
+ *********************************************/
+void poll_wind()       //  ****************************** Wind Functions********************
+{
+  if (SampleRequired)
+  {
+    // Velocity = P(2.25/T) = Roations * (2.25/3s) = R * 0.75
+    current_measures.wind_mph = Rotations * 0.75;
+    Rotations = 0;
+    uart_putstring("Wind Speed: ");
+    uart_write_uint16(current_measures.wind_mph);
+
+    SampleRequired = 0;
+  }
+}
+
+// This is the function that the interrupt calls to increment the rotation count
+ISR(INT4_vector) 
+{
+  if((millis() - ContactBounceTime) > 15 ) 
+  {   
+    // debounce the switch contact.
+    Rotations++;
+    ContactBounceTime = millis();
+  }
 }
 
 /*******************************************************************************/
@@ -592,14 +682,16 @@ void setup()
   // LED on Bluno Mega is PB7
   DDRB |= (1 <<DDB7); 
 
-  cli();//stop interrupts
+  // Disable Interrupts
+  cli();
 
   // Initialize the Timers
   init_t1();          // Timer 1 for polling sensors
-  init_t3();          // Timer 3 for light polling
-  init_t4();          // Timer 4 for polling barometric pressure
-  
-  sei();//allow interrupts
+  init_t3();          // Timer 3 for PWMs
+  init_t4();          // Timer 4 for polling barometric pressure 
+  init_t5();          // Timer 5 for debouncing wind sensor
+//  TIMER1_COUNT = 0;
+//  TIMER4_COUNT = 0;
 
   // Initialize the I2C
   init_twi();
@@ -610,9 +702,26 @@ void setup()
   init_uart0(ubrr);
 
   // Initialize the ADC
+  // Starts first conversion which will take 25 clock cycles at 128kHz
   init_adc(); 
 
-  uart_putstring("start adc\n");
+  // Initialize Sensors
+  
+  // Initialize Wind
+  SampleRequired = false;
+  Rotations = 0;
+  // Set Wind Pin (A0) to input and enable external interrupts for falling edge
+  DDRE |= (0 << WIND_PIN);
+  EICRB |= (1 << ISC41) | (1 << ISC40);
+  EIMSK |= (1 << INT4);
+  EIFR |= (0 << INTF4);
+  // Initilaize Barometrice Pressure
+  init_bp();
+
+
+  // Set Global Inerrupt Enable
+  sei();
+
   // Get ADC reading on channel 0
   //uint16_t adc_result = adc_get_conversion(0);
   //adc_result >> 2;
@@ -622,8 +731,8 @@ void setup()
 void loop() 
 {
   // If the chip receives anything, transmit it back
-  if (UCSR0A & (1 << RXC0))
-  {
-    uart_tx(uart_rx());
-  }
+//  if (UCSR0A & (1 << RXC0))
+//  {
+//    uart_tx(uart_rx());
+//  }
 }
