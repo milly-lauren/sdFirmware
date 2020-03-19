@@ -108,6 +108,23 @@ volatile unsigned long ContactBounceTime; // Timer to avoid contact bounce in is
 /********************************
  *        Timer Functions
  ********************************/
+// Timer 0 (A&B) for PWM (Also init_pwm())
+void init_t0()
+{
+  /* Enable TC0 */
+  PRR0 &= ~(1 << PRTIM0);
+  TCCR0A = 0;
+  TCCR0B = 0;
+
+  TCCR0A = (0 << COM0A1) | (0 << COM0A0)   /* Normal port operation, OCA disconnected */
+           | (0 << COM0B1) | (0 << COM0B0) /* Normal port operation, OCB disconnected */
+           | (1 << CS00)                   /* No prescalar */
+           | (1 << WGM01) | (1 << WGM00);  /* Mode 3 - Fast PWM; TOP : 0xFF, Update OCRx at TOP, set TOV flag at MAX */
+
+  TCCR0B = (0 << CS02) | (1 << WGM02);    /* No prescalar and Fast PWM mode */
+
+}
+ 
 // Timer 1 for polling humidity and start ADC
 void init_t1()
 {
@@ -134,25 +151,13 @@ void init_t1()
  
 }
 
-// Timer 3 for PWMs
+// Timer 3 - 16 bit Open
 void init_t3()
 {
    // Initialize the timer
    TCCR3A = 0;
    TCCR3B = 0;
    TCNT3  = 0;
-   
-   // Compare Match Register
-   // 10 second delay right now
-   OCR3A = 40960;
-   // CTC mode
-   TCCR3B |= (1 << WGM32);
-   
-   // Set CS12 and CS10 bits for 1024 prescaler
-   TCCR3B |= (1 << CS32) | (1 << CS30);  
-   
-   // Enable timer compare interrupt
-   TIMSK3 |= (1 << OCIE3A);
  
 }
 
@@ -205,7 +210,6 @@ ISR(TIMER1_COMPA_vect)
 {  
    
    TIMER1_COUNT++;
-//   uart_putstring("timer 1 ISR ");
    uart_write_uint16(TIMER1_COUNT);
    uart_putstring("\n");
    if (TIMER1_COUNT >= 4)
@@ -467,9 +471,72 @@ uint16_t adc_result()
 
 
 /*********************************************
+*                PWM Functions
+*********************************************/
+
+void PWM0_disable()
+{
+ // Return to non-operating mode on OC0A pin
+  TCCR0A &= ~((0 << COM0A1) | (0 << COM0A0));
+
+  //Return to non-operating mode on OC0B. pin
+  TCCR0B &= ~((0 << COM0B1) | (0 << COM0B0));
+}
+
+void PWM0_enable()
+{
+  // Clear OC0A on Compare Match, set OC0A  at BOTTOM
+  // Non-inverting mode
+  TCCR0A |= ((1 << COM0A1) | (0 << COM0A0));
+  OCR0A = 255;
+
+   // Clear OC0B on Compare Match, set OC0B at BOTTOM
+  // Non-inverting mode
+  TCCR0B |= ((1 << COM0B1) | (0 << COM0B0));
+  OCR0B = 254;
+}
+
+/*********************************************
  *                Sensor Functions
  *********************************************/
-void init_bp()
+void init_wind()
+{
+  SampleRequired = false;
+  Rotations = 0;
+  // Set Wind Pin (A0 pin 78) to input and enable external interrupts for falling edge
+  DDRE |= (0 << WIND_PIN);
+  EICRB |= (1 << ISC41) | (1 << ISC40);         // External interrupt (Wind) - rising edge between two sample results in interrupt
+  EIMSK |= (1 << INT4);                         // External interrupt INT4 Pin 6
+  EIFR |= (0 << INTF4);                         // Clear ext int flag
+  
+}
+
+void poll_wind()       //  ****************************** Wind Functions********************
+{
+  if (SampleRequired)
+  {
+    // Velocity = P(2.25/T) = Roations * (2.25/3s) = R * 0.75
+    current_measures.wind_mph = Rotations * 0.75;
+    Rotations = 0;
+    uart_putstring("Wind Speed: ");
+    uart_write_uint16(current_measures.wind_mph);
+
+    SampleRequired = 0;
+  }
+}
+
+// This is the function that the interrupt calls to increment the rotation count
+ISR(INT4_vector) 
+{
+  if((millis() - ContactBounceTime) > 15 ) 
+  {   
+    // debounce the switch contact.
+    Rotations++;
+    ContactBounceTime = millis();
+  }
+}
+
+void init_bp()        //  ****************************** BP Functions********************
 {
     // Function used to initialize the pressure sensor
     // Set mode to forced, every time set to forced = measurement
@@ -525,7 +592,7 @@ float poll_bp()
     return pressure;
 }
 
-float poll_humidity()
+float poll_humidity()       //  ****************************** Humidity Functions********************
 {
     // Humidity Sensor Address(s)
     uint8_t addr_w = 0x70;
@@ -548,6 +615,20 @@ float poll_humidity()
     float humidity = 1;
     return humidity;
 }
+
+
+void init_prox()                      // ****************** proximity sensor ******************
+{
+  
+}
+
+
+void poll_prox()
+{
+
+}
+
+
 
 /*********************************************
  *             Aditional Functions
@@ -610,12 +691,23 @@ void check_thresholds()                 // ****************** threshold checks *
 int get_roof_state()
 {
   // Now this is going to be either check proximity sensors or just check global? 
+  
   return poll_proximity_sensors();
 }
 
 void change_roof_state(int new_setting)
 {
-  // Send PWM to actuators
+  PWM0_enable();
+
+  
+  // Set delay here or put in proximity 
+  /*
+   * int cur_roof = get_roof_status();      // this would be polling the proximity sensor s 
+   * 
+   */
+
+   PWM0_disable();
+  
 }
 
 int poll_proximity_sensors()
@@ -640,33 +732,6 @@ float calc_hi()
 }
 
 
-/*********************************************
- *               Wind Functions
- *********************************************/
-void poll_wind()       //  ****************************** Wind Functions********************
-{
-  if (SampleRequired)
-  {
-    // Velocity = P(2.25/T) = Roations * (2.25/3s) = R * 0.75
-    current_measures.wind_mph = Rotations * 0.75;
-    Rotations = 0;
-    uart_putstring("Wind Speed: ");
-    uart_write_uint16(current_measures.wind_mph);
-
-    SampleRequired = 0;
-  }
-}
-
-// This is the function that the interrupt calls to increment the rotation count
-ISR(INT4_vector) 
-{
-  if((millis() - ContactBounceTime) > 15 ) 
-  {   
-    // debounce the switch contact.
-    Rotations++;
-    ContactBounceTime = millis();
-  }
-}
 
 /*******************************************************************************/
 /*******************************************************************************/
@@ -679,26 +744,28 @@ void setup()
 {
   // Set up code
   
-  // LED on Bluno Mega is PB7
+  // LED on Bluno Mega is PB7 (Will be also set for the actuator PWMs)
   DDRB |= (1 <<DDB7); 
 
+  // Set pins for PWM
+  DDRG |= (1 << DDG5);
+  
   // Disable Interrupts
   cli();
 
   // Initialize the Timers
+  init_t0();          // Timer 0 for PWMs (PWM init)
   init_t1();          // Timer 1 for polling sensors
-  init_t3();          // Timer 3 for PWMs
+  init_t3();          // Timer 3 open (can do PWMs with 16 bit)
   init_t4();          // Timer 4 for polling barometric pressure 
   init_t5();          // Timer 5 for debouncing wind sensor
-//  TIMER1_COUNT = 0;
-//  TIMER4_COUNT = 0;
 
   // Initialize the I2C
   init_twi();
   
   // Initialize the USART 
   // Baud is 9600 in serial monitor 
-  uint8_t ubrr = MYUBRR;
+  uint8_t ubrr = MYUBRR;        // Check macros for definitiona
   init_uart0(ubrr);
 
   // Initialize the ADC
@@ -706,16 +773,10 @@ void setup()
   init_adc(); 
 
   // Initialize Sensors
-  
   // Initialize Wind
-  SampleRequired = false;
-  Rotations = 0;
-  // Set Wind Pin (A0) to input and enable external interrupts for falling edge
-  DDRE |= (0 << WIND_PIN);
-  EICRB |= (1 << ISC41) | (1 << ISC40);
-  EIMSK |= (1 << INT4);
-  EIFR |= (0 << INTF4);
-  // Initilaize Barometrice Pressure
+  init_wind();
+  
+   // Initilaize Barometrice Pressure
   init_bp();
 
 
