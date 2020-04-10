@@ -9,10 +9,13 @@
  *  - Humidity
  *  - UV
  *  
- *  To Do:
+ * To Do:
  *  -Finish UV light functions
  *  -Send average data to the phone, 
  *    should just be opposite as read
+ *    
+ *   
+ *    
  */
 
 #include <avr/io.h>
@@ -265,6 +268,21 @@ ISR(USART0_RX_vect)
 }
 
 /********************************
+ *      Bluetooth Functions
+ ********************************/
+// This is the function to call when a new  
+void loop_bluetooth()
+{
+  
+}
+ 
+void send_bluetooth(float measurement)
+{
+  uint8_t whole = measurement;
+  uint8_t dec = (measurement - whole) * 100;
+}
+
+/********************************
  *        Sensor Functions
  ********************************/
 // Read any new threshold values
@@ -418,7 +436,6 @@ float poll_hum()
     sensorT |= lowerT;
 
     // This gives you temperature
-    // T = -49 * 315 SensorT / 65535
     uart_putstring("temp from H:\n");
     uart_write_uint16(floor(sensorT));  
     
@@ -660,6 +677,8 @@ int get_roof_state()
 void change_roof_state(int new_setting)
 {
   // New setting will be 0/1 and can use that to be able to tell direction of the actuators
+  ROOF_STATUS = new_setting
+  
   // PWM enable outputs 5V on the pin
   PWM0_enable();
 
@@ -829,9 +848,27 @@ uint8_t twi_status_NA()
 
 }
 
+/******************************************************************************************/
+/******************************************************************************************/
+void init_values()
+{
+  // Initialize the thresholds for default
+  sensor_thresholds.max_temp = 100;
+  sensor_thresholds.min_temp = 32;
+  sensor_thresholds.wind_mph = 28;
+  sensor_thresholds.relative_humidity = 82; 
+  sensor_thresholds.heat_index = 110;
+  sensor_thresholds.uv_index = 11;
 
-/******************************************************************************************/
-/******************************************************************************************/
+  // Initialize the behaviors for default
+  roof_behaviors.max_temp = 1;
+  roof_behaviors.min_temp = 0;
+  roof_behaviors.wind_mph = 0;
+  roof_behaviors.relative_humidity = 0;
+  roof_behaviors.heat_index = 0;
+  roof_behaviors.uv_index = 0;
+  roof_behaviors.rain = 0; 
+}
 
 /******************************************************************************************/
 // Main functions, setup runs once at the start, loop runs continously. Loop should be bare
@@ -848,6 +885,10 @@ void setup()
   
   // Disable Interrupts
   cli();
+
+  // Initialize all the values in structures and the roof 
+  ROOF_STATUS = 1;   // Starts open
+  init_values();
 
   // Initialize the Timers
   init_t0();
