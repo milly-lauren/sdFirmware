@@ -135,9 +135,9 @@ ISR(USART0_RX_vect)
       int rain = poll_rain(); 
       // Closer to 1V means more wet (add this as comment to video bc cant send float)
       // Use rain value to calculate the Vin 
-      // Vin = ADC * 3.3 / 256
-      // = ADC * 3.3 / 256
-      // = ADC * 0.01289
+      // Vin = ADC * 5 / 256
+      // = ADC * 5 / 256
+      // = ADC * 0.01953
       uart_putstring("Rain V:");
       uart_write_uint8(rain);
       uart_putstring("\n");      
@@ -184,8 +184,6 @@ void init_humidity()          //  ****************************** Humidity Functi
     if((TWSR & 0xF8) == 0x20)
     {
       uart_putstring("SLA+W NACK\n");
-      // As long as not receiving an ACK resend
-      //twi_write(addr_w);
     }
 
     // Send Write Command
@@ -211,6 +209,9 @@ void init_humidity()          //  ****************************** Humidity Functi
 // DO NOT TOUCH HUMIDITY
 uint16_t poll_hum()       
 {    
+    // Write the command to the sensor
+    init_humidity();
+    
     // Send START again and read command 
     uint8_t addr_r = 0x89;
     twi_start();
@@ -279,34 +280,16 @@ uint16_t poll_uv()
 // ADC conversion and averaging for rain
 int poll_rain()
 {
-  // Average ADC
-  int i = 1;
-  uint8_t rain, avg_rain = 0;
-  
-  while (i <= 5)
-  { 
-    int temp_rain = adc_get_conversion(RAIN_CH);
-    if (temp_rain == 0)
-    {
-      // This doesnt make sense but sometimes the ADC needs to read the other to work 
-      // so just call it
-      float temp = poll_temp();
-      continue;
-    }
-    i++;
-    avg_rain += temp_rain;
-  }
-  rain = avg_rain / 5;
+  int rain = adc_get_conversion(RAIN_CH);
 
   // Vin = ADC * 3.3 / 256
   // = ADC * 3.3 / 256
   // = ADC * 0.01289
   float V = (float)rain * 0.01289;
-  int rain_bool = 0;
+  
   if (V < 2.0 )
   {
     uart_putstring("Rain sensed\n");
-    rain_bool = 1;
   }
 
   return rain;  
